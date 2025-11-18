@@ -1,3 +1,8 @@
+# touch: refresh webhook
+version: 1
+services:
+  - type: postgres
+  ...
 version: 1
 services:
   - type: postgres
