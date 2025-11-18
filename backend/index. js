@@ -1,0 +1,132 @@
+// backend/index.js
+// Combined backend + static frontend server for Sinux Dashboard.
+
+const express = require('express');
+const path = require('path');
+const { Pool } = require('pg');
+const bodyParser = require('body-parser');
+const dotenv = require('dotenv');
+
+dotenv.config();
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+const app = express();
+app.use(bodyParser.json());
+
+// Serve static frontend files from /frontend
+app.use('/', express.static(path.join(__dirname, '..', 'frontend')));
+
+// Simple health check
+app.get('/api/health', (_req, res) => res.json({ ok: true }));
+
+// List payments (most recent 50)
+app.get('/api/payments', async (req, res) => {
+  try {
+    const r = await pool.query('SELECT * FROM payments ORDER BY received_at DESC LIMIT $1', [50]);
+    res.json({ items: r.rows });
+  } catch (e) {
+    console.error('GET /api/payments error', e);
+    res.status(500).json({ error: 'db' });
+  }
+});
+
+// Webhook to insert a payment
+app.post('/api/payments/webhook', async (req, res) => {
+  try {
+    const { provider_id, amount_cents, payment_method, received_at, raw_payload } = req.body;
+    if (!provider_id) return res.status(400).json({ error: 'provider_id required' });
+    await pool.query(
+      `INSERT INTO payments(provider_id, amount_cents, payment_method, received_at, raw_payload)
+       VALUES ($1,$2,$3,$4,$5) ON CONFLICT (provider_id) DO NOTHING`,
+      [provider_id, amount_cents || 0, payment_method || 'unknown', received_at || new Date(), raw_payload || {}]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('POST /api/payments/webhook error', e);
+    res.status(500).json({ error: 'server' });
+  }
+});
+
+// Auto-reconcile: simple exact-amount match
+app.post('/api/reconcile/auto', async (req, res) => {
+  try {
+    const paymentsRes = await pool.query(
+      `SELECT * FROM payments p WHERE NOT EXISTS (SELECT 1 FROM reconciliations r WHERE r.payment_id = p.id) LIMIT 200`
+    );
+    const payments = paymentsRes.rows;
+    let matched = 0;
+    for (const p of payments) {
+      const ordersRes = await pool.query('SELECT * FROM orders WHERE expected_amount_cents = $1 LIMIT 1', [p.amount_cents]);
+      if (ordersRes.rowCount > 0) {
+        const order = ordersRes.rows[0];
+        await pool.query(
+          `INSERT INTO reconciliations(payment_id, order_id, match_method, status, diff_cents)
+           VALUES ($1,$2,$3,$4,$5)`,
+          [p.id, order.id, 'auto_exact_amount', 'matched', p.amount_cents - order.expected_amount_cents]
+        );
+        matched++;
+      } else {
+        await pool.query(
+          `INSERT INTO reconciliations(payment_id, match_method, status, diff_cents)
+           VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING`,
+          [p.id, 'auto_no_match', 'unmatched', 0]
+        );
+      }
+    }
+    res.json({ ok: true, matched });
+  } catch (e) {
+    console.error('POST /api/reconcile/auto error', e);
+    res.status(500).json({ error: 'server' });
+  }
+});
+
+// Manual match: paymentId -> orderRef
+app.post('/api/reconcile/manual', async (req, res) => {
+  try {
+    const { paymentId, orderRef } = req.body;
+    if (!paymentId || !orderRef) return res.status(400).json({ error: 'paymentId and orderRef required' });
+    const ord = await pool.query('SELECT id, expected_amount_cents FROM orders WHERE order_ref=$1 LIMIT 1', [orderRef]);
+    if (ord.rowCount === 0) return res.status(404).json({ error: 'order not found' });
+    const order = ord.rows[0];
+    const pay = await pool.query('SELECT amount_cents FROM payments WHERE id=$1 LIMIT 1', [paymentId]);
+    if (pay.rowCount === 0) return res.status(404).json({ error: 'payment not found' });
+    const diff = pay.rows[0].amount_cents - order.expected_amount_cents;
+    await pool.query(
+      'INSERT INTO reconciliations(payment_id, order_id, match_method, status, diff_cents) VALUES ($1,$2,$3,$4,$5)',
+      [paymentId, order.id, 'manual', 'matched', diff]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('POST /api/reconcile/manual error', e);
+    res.status(500).json({ error: 'server' });
+  }
+});
+
+// Reconciliation history
+app.get('/api/reconcile/history', async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT r.*, p.provider_id, o.order_ref
+       FROM reconciliations r
+       LEFT JOIN payments p ON p.id = r.payment_id
+       LEFT JOIN orders o ON o.id = r.order_id
+       ORDER BY matched_at DESC LIMIT 200`
+    );
+    res.json({ items: r.rows });
+  } catch (e) {
+    console.error('GET /api/reconcile/history error', e);
+    res.status(500).json({ error: 'db' });
+  }
+});
+
+// Serve index.html for non-API routes (SPA)
+app.get('*', (req, res) => {
+  if (req.path.startsWith('/api')) return res.status(404).json({ error: 'not found' });
+  res.sendFile(path.join(__dirname, '..', 'frontend', 'index.html'));
+});
+
+const PORT = process.env.PORT || 4000;
+app.listen(PORT, () => {
+  console.log(`Sinux dashboard running on port ${PORT}`);
+});
