@@ -6,12 +6,12 @@ services:
     region: oregon
 
   - type: web
-    name: sinux-dashboard-backend
-    rootDir: backend
+    name: sinux-dashboard
+    rootDir: .
     runtime: node
     branch: main
-    buildCommand: npm install
-    startCommand: npm run dev
+    buildCommand: npm install --prefix backend
+    startCommand: npm start --prefix backend
     envVars:
       - key: DATABASE_URL
         fromDatabase:
@@ -19,16 +19,6 @@ services:
           property: connectionString
       - key: JWT_SECRET
         value: "dev_secret_change_me"
-
-  - type: static
-    name: sinux-dashboard
-    rootDir: frontend
-    branch: main
-    buildCommand: npm install && npm run build
-    staticPublishPath: dist
-    envVars:
-      - key: VITE_API_BASE
-        fromService:
-          name: sinux-dashboard-backend
-          type: web
-          envVarKey: RENDER_EXTERNAL_URL
+    plan: free
+    disk:
+      sizeGB:
